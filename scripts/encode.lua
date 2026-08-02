@@ -11,6 +11,26 @@ local profile_start = ""
 local timer = nil
 local timer_duration = 2
 
+local settings = {
+    detached = true,
+    container = "",
+    only_active_tracks = false,
+    preserve_filters = true,
+    append_filter = "",
+    codec = "-an -sn -c:v libvpx -crf 10 -b:v 1000k",
+    output_format = "$f_$n.webm",
+    output_directory = "",
+    ffmpeg_command = "ffmpeg",
+    print = true,
+    nomap = false,
+    gif = false,
+    gif_fps = 10,
+    gif_scale = "",
+    gif_palettegen = "",
+    gif_paletteuse = "",
+}
+
+
 function append_table(lhs, rhs)
     for i = 1,#rhs do
         lhs[#lhs+1] = rhs[i]
@@ -55,6 +75,12 @@ function get_output_string(dir, format, input, extension, title, from, to, profi
     output = string.gsub(output, "$s", function() return seconds_to_time_string(from, true) end)
     output = string.gsub(output, "$e", function() return seconds_to_time_string(to, true) end)
     output = string.gsub(output, "$d", function() return seconds_to_time_string(to-from, true) end)
+    if (track_type == "sub" and settings.only_active_tracks == false) or (track_type == "sub" and settings.only_active_tracks == true and sub_visiable == true) then
+        output = string.gsub(output, "$x", "mkv")
+    else
+        output = string.gsub(output, "$x", function() return extension end)
+    end
+    -- output = string.gsub(output, "$x", function() return extension end)
     output = string.gsub(output, "$x", function() return extension end)
     output = string.gsub(output, "$p", function() return profile end)
     if ON_WINDOWS then
@@ -103,11 +129,19 @@ function get_video_filters()
 end
 
 function get_input_info(default_path, only_active)
-    local accepted = {
-        video = true,
-        audio = not mp.get_property_bool("mute"),
-        sub = mp.get_property_bool("sub-visibility")
-    }
+    local accepted
+    if not settings.nomap then
+        accepted = {
+            video = true,
+            audio = not mp.get_property_bool("mute"),
+            sub = mp.get_property_bool("sub-visibility")
+        }
+    else accepted = {
+            video = true,
+            audio = false,
+            sub = false
+        }
+    end
     local ret = {}
     for _, track in ipairs(mp.get_property_native("track-list")) do
         local track_path = track["external-filename"] or default_path
@@ -151,14 +185,17 @@ function start_encoding(from, to, settings)
     local track_args = {}
     local start = seconds_to_time_string(from, false)
     local input_index = 0
+    local sub_in_path
     for input_path, tracks in pairs(get_input_info(path, settings.only_active_tracks)) do
-       append_args({
+        sub_in_path = string.gsub(string.gsub(input_path, "\\", "\\\\"), ":", "\\:")
+        append_args({
             "-ss", start,
+            "-t", string.format("%.3f", to-from),
             "-i", input_path,
         })
         if settings.only_active_tracks then
             for _, track_index in ipairs(tracks) do
-                track_args = append_table(track_args, { "-map", string.format("%d:%d", input_index, track_index)})
+            track_args = append_table(track_args, { "-map", string.format("%d:%d", input_index, track_index)})
             end
         else
             track_args = append_table(track_args, { "-map", tostring(input_index)})
@@ -166,8 +203,76 @@ function start_encoding(from, to, settings)
         input_index = input_index + 1
     end
 
-    append_args({"-to", tostring(to-from)})
-    append_args(track_args)
+    sub_visiable = mp.get_property_bool("sub-visibility")
+    track_type = nil
+
+    local i = 0
+    local tracks_count = mp.get_property_number("track-list/count")
+    local sub_ex
+    local sub_in
+    while i < tracks_count do
+        track_type = mp.get_property(string.format("track-list/%d/type", i))
+        local track_index = mp.get_property_number(string.format("track-list/%d/id", i))
+        local track_selected = mp.get_property(string.format("track-list/%d/selected", i))
+        local track_external = mp.get_property(string.format("track-list/%d/external", i))
+        local track_external_filename = mp.get_property(string.format("track-list/%d/external-filename", i))
+        if track_type == "sub" and track_selected == "yes" then
+            if track_external == "yes" then
+                sub_ex = string.gsub(string.gsub(track_external_filename, "\\", "\\\\"), ":", "\\:")
+            else
+                sub_in = track_index - 1
+            end
+            break
+        else
+            i = i + 1
+        end
+    end
+
+    local args_sub_ex
+    local args_sub_in
+    local sub_ex_on = (sub_visiable == true and sub_ex)
+    local sub_in_on = (sub_visiable == true and sub_in)
+    if sub_ex_on then
+        args_sub_ex = "subtitles='" .. sub_ex .. "',setpts=PTS+" .. from .. "/TB"
+    elseif sub_in_on then
+        args_sub_in = "subtitles='" .. sub_in_path .. ":si=" .. sub_in .. "',setpts=PTS+" .. from .. "/TB"
+    else
+    end
+
+    if settings.gif then
+        local gif_args_vf = "[0:v]fps=" .. settings.gif_fps .. ",scale=" .. settings.gif_scale
+        local gif_args_palette = settings.gif_palettegen .. settings.gif_paletteuse
+        if sub_ex_on then
+            append_args({
+                "-copyts",
+                "-filter_complex", gif_args_vf .. "," .. args_sub_ex .. gif_args_palette,
+            })
+        elseif sub_in_on then
+            append_args({
+                "-copyts",
+                "-filter_complex", gif_args_vf .. "," .. args_sub_in .. gif_args_palette,
+            })
+        else
+            append_args({
+                "-filter_complex", gif_args_vf .. gif_args_palette,
+            })
+        end
+    elseif settings.nomap then
+        if sub_ex_on then
+            append_args({
+                "-copyts",
+                "-vf", args_sub_ex,
+            })
+        elseif sub_in_on then
+            append_args({
+                "-copyts",
+                "-vf", args_sub_in,
+            })
+        else
+        end
+    else
+        append_args(track_args)
+    end
 
     -- apply some of the video filters currently in the chain
     local filters = {}
@@ -185,7 +290,9 @@ function start_encoding(from, to, settings)
     for token in string.gmatch(settings.codec, "[^%s]+") do
         args[#args + 1] = token
     end
-
+    if settings.profile == "encode_slice" and track_type == "sub" then
+        append_args({ "-disposition:s:0", "default" })
+    end
     -- path of the output
     local output_directory = settings.output_directory
     if output_directory == "" then
@@ -228,7 +335,10 @@ function start_encoding(from, to, settings)
     if settings.detached then
         utils.subprocess_detached({ args = args })
     else
+        local screenx, screeny, aspect = mp.get_osd_size()
+        mp.set_osd_ass(screenx, screeny, "{\\an9}● ")
         local res = utils.subprocess({ args = args, max_size = 0, cancellable = false })
+        mp.set_osd_ass(screenx, screeny, "")
         if res.status == 0 then
             mp.osd_message("Finished encoding succesfully")
         else
@@ -286,18 +396,6 @@ function set_timestamp(profile)
         -- include the current frame into the extract
         local fps = mp.get_property_number("container-fps") or 30
         to = to + 1 / fps / 2
-        local settings = {
-            detached = true,
-            container = "",
-            only_active_tracks = false,
-            preserve_filters = true,
-            append_filter = "",
-            codec = "-an -sn -c:v libvpx -crf 10 -b:v 1000k",
-            output_format = "$f_$n.webm",
-            output_directory = "",
-            ffmpeg_command = "ffmpeg",
-            print = true,
-        }
         if profile then
             options.read_options(settings, profile)
             if settings.container ~= "" then
