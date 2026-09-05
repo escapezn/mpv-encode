@@ -4,6 +4,23 @@ local options = require "mp.options"
 
 local ON_WINDOWS = (package.config:sub(1,1) ~= "/")
 
+local has_ffi, ffi = pcall(require, "ffi")
+if has_ffi and ON_WINDOWS then
+    ffi.cdef[[
+        void* _wfopen(const wchar_t* filename, const wchar_t* mode);
+        size_t fread(void* ptr, size_t size, size_t nmemb, void* stream);
+        size_t fwrite(const void* ptr, size_t size, size_t nmemb, void* stream);
+        int fclose(void* stream);
+        long ftell(void* stream);
+        int fseek(void* stream, long offset, int origin);
+        int MultiByteToWideChar(unsigned int CodePage, unsigned long dwFlags, const char* lpMultiByteStr, int cbMultiByte, wchar_t* lpWideCharStr, int cchWideChar);
+        int CreateHardLinkW(const wchar_t* lpFileName, const wchar_t* lpExistingFileName, void* lpSecurityAttributes);
+        unsigned long GetFileAttributesW(const wchar_t* lpFileName);
+        int CreateDirectoryW(const wchar_t* lpPathName, void* lpSecurityAttributes);
+        int DeleteFileW(const wchar_t* lpFileName);
+    ]]
+end
+
 local start_timestamp = nil
 local profile_start = ""
 
@@ -28,6 +45,9 @@ local settings = {
     gif_scale = "",
     gif_palettegen = "",
     gif_paletteuse = "",
+    auto_fonts = true,
+    font_index_path = "",
+    temp_fonts_dir = "",
 }
 
 
@@ -38,7 +58,54 @@ function append_table(lhs, rhs)
     return lhs
 end
 
+local function utf8_to_wide(str)
+    if not (has_ffi and ON_WINDOWS and str) then return nil end
+    local CP_UTF8 = 65001
+    local len = ffi.C.MultiByteToWideChar(CP_UTF8, 0, str, #str, nil, 0)
+    local wstr = ffi.new("wchar_t[?]", len + 1)
+    ffi.C.MultiByteToWideChar(CP_UTF8, 0, str, #str, wstr, len)
+    wstr[len] = 0
+    return wstr
+end
+
+local function read_file_content(path)
+    if has_ffi and ON_WINDOWS then
+        local wpath = utf8_to_wide(path)
+        local wmode = utf8_to_wide("rb")
+        if wpath and wmode then
+            local fp = ffi.C._wfopen(wpath, wmode)
+            if fp ~= nil then
+                ffi.C.fseek(fp, 0, 2)
+                local size = tonumber(ffi.C.ftell(fp))
+                ffi.C.fseek(fp, 0, 0)
+                local buf = ffi.new("char[?]", size)
+                local read_bytes = tonumber(ffi.C.fread(buf, 1, size, fp))
+                ffi.C.fclose(fp)
+                return ffi.string(buf, read_bytes)
+            end
+        end
+    end
+    local f = io.open(path, "rb")
+    if f then
+        local c = f:read("*a")
+        f:close()
+        return c
+    end
+    return nil
+end
+
 function file_exists(name)
+    if not name or name == "" then return false end
+    if has_ffi and ON_WINDOWS then
+        local INVALID_FILE_ATTRIBUTES = 0xFFFFFFFF
+        local wpath = utf8_to_wide(name)
+        if wpath then
+            local attr = ffi.C.GetFileAttributesW(wpath)
+            if attr ~= INVALID_FILE_ATTRIBUTES then
+                return true
+            end
+        end
+    end
     local f = io.open(name, "r")
     if f ~= nil then
         io.close(f)
@@ -46,6 +113,227 @@ function file_exists(name)
     else
         return false
     end
+end
+
+local function unescape_xml(str)
+    if not str then return "" end
+    str = string.gsub(str, "&amp;", "&")
+    str = string.gsub(str, "&lt;", "<")
+    str = string.gsub(str, "&gt;", ">")
+    str = string.gsub(str, "&quot;", "\"")
+    str = string.gsub(str, "&apos;", "'")
+    return str
+end
+
+local function trim_str(s)
+    return (string.gsub(s, "^%s*(.-)%s*$", "%1"))
+end
+
+local function parse_ass_fonts(content)
+    if not content or content == "" then return {} end
+    local fonts = {}
+    for line in string.gmatch(content, "[^\r\n]+") do
+        local style_line = string.match(line, "^%s*Style:%s*(.*)$")
+        if style_line then
+            local parts = {}
+            for part in string.gmatch(style_line .. ",", "([^,]*),") do
+                parts[#parts + 1] = part
+            end
+            if #parts >= 2 then
+                local fontname = trim_str(parts[2])
+                if fontname:sub(1, 1) == "@" then
+                    fontname = fontname:sub(2)
+                end
+                if fontname ~= "" then
+                    fonts[fontname] = true
+                end
+            end
+        end
+        for fn in string.gmatch(line, "\\fn([^\\}]+)") do
+            local fontname = trim_str(fn)
+            if fontname:sub(1, 1) == "@" then
+                fontname = fontname:sub(2)
+            end
+            if fontname ~= "" then
+                fonts[fontname] = true
+            end
+        end
+    end
+    return fonts
+end
+
+local g_font_index_cache = nil
+local g_font_index_path_cached = nil
+
+local function get_font_index_content(index_path)
+    if not file_exists(index_path) then return nil end
+    if g_font_index_cache and g_font_index_path_cached == index_path then
+        return g_font_index_cache
+    end
+    local content = read_file_content(index_path)
+    if content then
+        g_font_index_cache = content
+        g_font_index_path_cached = index_path
+    end
+    return content
+end
+
+local function find_font_paths_in_index(index_content, fonts)
+    local matched_paths = {}
+    local lower_index_content = nil
+    for font_name, _ in pairs(fonts) do
+        local target = ">" .. font_name .. "<"
+        local pos = string.find(index_content, target, 1, true)
+        if not pos then
+            if not lower_index_content then
+                lower_index_content = string.lower(index_content)
+            end
+            pos = string.find(lower_index_content, string.lower(target), 1, true)
+        end
+        if pos then
+            local chunk_start = math.max(1, pos - 2000)
+            local sub_str = string.sub(index_content, chunk_start, pos)
+            local tag = '<FontFace path="'
+            local last_pos = nil
+            local s_from = 1
+            while true do
+                local p = string.find(sub_str, tag, s_from, true)
+                if not p then break end
+                last_pos = chunk_start + p - 1
+                s_from = p + #tag
+            end
+            if last_pos then
+                local start_p = last_pos + #tag
+                local end_p = string.find(index_content, '"', start_p, true)
+                if end_p then
+                    local raw_path = string.sub(index_content, start_p, end_p - 1)
+                    local path = unescape_xml(raw_path)
+                    if file_exists(path) then
+                        matched_paths[path] = true
+                    end
+                end
+            end
+        end
+    end
+    return matched_paths
+end
+
+local function ensure_dir(dir_path)
+    if has_ffi and ON_WINDOWS then
+        local wdir = utf8_to_wide(dir_path)
+        if wdir then ffi.C.CreateDirectoryW(wdir, nil) end
+    else
+        os.execute('mkdir "' .. dir_path .. '" 2>nul')
+    end
+end
+
+local function delete_file(path)
+    if has_ffi and ON_WINDOWS then
+        local wpath = utf8_to_wide(path)
+        if wpath then ffi.C.DeleteFileW(wpath) end
+    else
+        os.remove(path)
+    end
+end
+
+local function link_or_copy_font(src_path, dst_path)
+    delete_file(dst_path)
+    if has_ffi and ON_WINDOWS then
+        local wsrc = utf8_to_wide(src_path)
+        local wdst = utf8_to_wide(dst_path)
+        if wsrc and wdst and ffi.C.CreateHardLinkW(wdst, wsrc, nil) ~= 0 then
+            return true
+        end
+    end
+    local data = read_file_content(src_path)
+    if not data then return false end
+    if has_ffi and ON_WINDOWS then
+        local wdst = utf8_to_wide(dst_path)
+        local wmode = utf8_to_wide("wb")
+        if wdst and wmode then
+            local fp = ffi.C._wfopen(wdst, wmode)
+            if fp ~= nil then
+                local written = tonumber(ffi.C.fwrite(data, 1, #data, fp))
+                ffi.C.fclose(fp)
+                return written == #data
+            end
+        end
+    end
+    local f = io.open(dst_path, "wb")
+    if f then
+        f:write(data)
+        f:close()
+        return true
+    end
+    return false
+end
+
+local function get_sub_fontsdir_opt(sub_file_or_video, track_idx_or_nil, enc_settings)
+    if not enc_settings.auto_fonts then return "" end
+    local index_path = enc_settings.font_index_path
+    if not index_path or index_path == "" then
+        return ""
+    end
+    index_path = mp.command_native({"expand-path", index_path}) or index_path
+    if not file_exists(index_path) then
+        return ""
+    end
+
+    local ass_content = nil
+    if track_idx_or_nil == nil then
+        ass_content = read_file_content(sub_file_or_video)
+    else
+        local temp_sub = utils.join_path(os.getenv("TEMP") or ".", "mpv_encode_temp_sub.ass")
+        local extract_args = {
+            enc_settings.ffmpeg_command,
+            "-loglevel", "panic", "-y",
+            "-i", sub_file_or_video,
+            "-map", string.format("0:%d", track_idx_or_nil),
+            "-c:s", "copy",
+            temp_sub
+        }
+        local res = utils.subprocess({ args = extract_args, cancellable = false })
+        if res.status == 0 and file_exists(temp_sub) then
+            ass_content = read_file_content(temp_sub)
+            delete_file(temp_sub)
+        end
+    end
+
+    if not ass_content or ass_content == "" then return "" end
+
+    local fonts = parse_ass_fonts(ass_content)
+    local has_any_font = false
+    for _ in pairs(fonts) do
+        has_any_font = true
+        break
+    end
+    if not has_any_font then return "" end
+
+    local index_content = get_font_index_content(index_path)
+    if not index_content then return "" end
+
+    local matched_paths = find_font_paths_in_index(index_content, fonts)
+    local has_matched = false
+    for _ in pairs(matched_paths) do
+        has_matched = true
+        break
+    end
+    if not has_matched then return "" end
+
+    local temp_dir = enc_settings.temp_fonts_dir
+    if not temp_dir or temp_dir == "" then
+        temp_dir = utils.join_path(os.getenv("TEMP") or ".", "mpv_encode_fonts")
+    end
+    ensure_dir(temp_dir)
+
+    for src_path, _ in pairs(matched_paths) do
+        local _, filename = utils.split_path(src_path)
+        local dst_path = utils.join_path(temp_dir, filename)
+        link_or_copy_font(src_path, dst_path)
+    end
+
+    local escaped_dir = string.gsub(string.gsub(temp_dir, "\\", "/"), ":", "\\:")
+    return ":fontsdir='" .. escaped_dir .. "'"
 end
 
 function get_extension(path)
@@ -209,6 +497,7 @@ function start_encoding(from, to, settings)
     local i = 0
     local tracks_count = mp.get_property_number("track-list/count")
     local sub_ex
+    local raw_sub_ex_filename
     local sub_in
     while i < tracks_count do
         track_type = mp.get_property(string.format("track-list/%d/type", i))
@@ -218,6 +507,7 @@ function start_encoding(from, to, settings)
         local track_external_filename = mp.get_property(string.format("track-list/%d/external-filename", i))
         if track_type == "sub" and track_selected == "yes" then
             if track_external == "yes" then
+                raw_sub_ex_filename = track_external_filename
                 sub_ex = string.gsub(string.gsub(track_external_filename, "\\", "\\\\"), ":", "\\:")
             else
                 sub_in = track_index - 1
@@ -232,10 +522,13 @@ function start_encoding(from, to, settings)
     local args_sub_in
     local sub_ex_on = (sub_visiable == true and sub_ex)
     local sub_in_on = (sub_visiable == true and sub_in)
+    local fontsdir_opt = ""
     if sub_ex_on then
-        args_sub_ex = "subtitles='" .. sub_ex .. "',setpts=PTS+" .. from .. "/TB"
+        fontsdir_opt = get_sub_fontsdir_opt(raw_sub_ex_filename, nil, settings)
+        args_sub_ex = "subtitles='" .. sub_ex .. "'" .. fontsdir_opt .. ",setpts=PTS+" .. from .. "/TB"
     elseif sub_in_on then
-        args_sub_in = "subtitles='" .. sub_in_path .. ":si=" .. sub_in .. "',setpts=PTS+" .. from .. "/TB"
+        fontsdir_opt = get_sub_fontsdir_opt(path, sub_in, settings)
+        args_sub_in = "subtitles='" .. sub_in_path .. ":si=" .. sub_in .. "'" .. fontsdir_opt .. ",setpts=PTS+" .. from .. "/TB"
     else
     end
 
