@@ -93,10 +93,14 @@ if has_ffi and ON_WINDOWS then
             LPSTARTUPINFOW lpStartupInfo,
             LPPROCESS_INFORMATION lpProcessInformation
         );
+        typedef void* HMODULE;
         DWORD ResumeThread(HANDLE hThread);
         DWORD WaitForSingleObject(HANDLE hHandle, DWORD dwMilliseconds);
         BOOL GetExitCodeProcess(HANDLE hProcess, DWORD* lpExitCode);
         BOOL CloseHandle(HANDLE hObject);
+        BOOL K32EnumProcessModules(HANDLE hProcess, HMODULE *lphModule, DWORD cb, DWORD *lpcbNeeded);
+        DWORD K32GetModuleBaseNameW(HANDLE hProcess, HMODULE hModule, LPWSTR lpBaseName, DWORD nSize);
+        void Sleep(DWORD dwMilliseconds);
     ]])
 end
 
@@ -129,6 +133,32 @@ local function utf8_to_wide(str)
     ffi.C.MultiByteToWideChar(65001, 0, str, #str, wstr, len)
     wstr[len] = 0
     return wstr
+end
+
+local function is_module_loaded(hProcess, module_prefix)
+    if not (has_ffi and hProcess) then return false end
+    local hMods = ffi.new("HMODULE[1024]")
+    local cbNeeded = ffi.new("DWORD[1]")
+    if ffi.C.K32EnumProcessModules(hProcess, hMods, ffi.sizeof(hMods), cbNeeded) == 0 then
+        return false
+    end
+    local count = cbNeeded[0] / ffi.sizeof("HMODULE")
+    local buf = ffi.new("wchar_t[260]")
+    local prefix = string.lower(module_prefix)
+    for i = 0, count - 1 do
+        local len = ffi.C.K32GetModuleBaseNameW(hProcess, hMods[i], buf, 260)
+        if len > 0 then
+            local chars = {}
+            for j = 0, len - 1 do
+                chars[#chars + 1] = string.char(buf[j] % 256)
+            end
+            local name = string.lower(table.concat(chars))
+            if string.find(name, prefix, 1, true) then
+                return true
+            end
+        end
+    end
+    return false
 end
 
 local function quote_windows_arg(arg)
@@ -248,17 +278,30 @@ local function execute_with_fonthelper(args, settings)
     local pid = tonumber(pi.dwProcessId)
     msg.info(string.format("FFmpeg created suspended (PID: %d), injecting FontHelper...", pid))
 
-    -- Perform injection
+    -- Launch daemon injection (detached with -auto-exit to seamlessly support both cold & warm starts)
     local inject_args = {
         daemon_path,
         "-inject", tostring(pid),
-        "-no-monitor"
+        "-no-monitor",
+        "-auto-exit",
+        "-no-tray"
     }
-    local inject_res = utils.subprocess({ args = inject_args, max_size = 0, cancellable = false })
-    if inject_res.status ~= 0 then
-        msg.warn(string.format("FontHelper injection returned non-zero status: %d", inject_res.status))
-    else
+    utils.subprocess_detached({ args = inject_args })
+
+    -- Wait until FontLoadInterceptor is loaded into target process (up to 2 seconds)
+    local injected = false
+    for _ = 1, 100 do
+        ffi.C.Sleep(20)
+        if is_module_loaded(pi.hProcess, "FontLoadInterceptor") then
+            injected = true
+            break
+        end
+    end
+
+    if injected then
         msg.info(string.format("FontHelper injected successfully into FFmpeg (PID: %d)", pid))
+    else
+        msg.warn(string.format("FontHelper injection wait timed out for PID: %d, resuming anyway", pid))
     end
 
     -- Resume FFmpeg main thread
