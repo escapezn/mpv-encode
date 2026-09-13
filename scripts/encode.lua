@@ -241,9 +241,6 @@ local function execute_with_fonthelper(args, settings)
     local pid = tonumber(pi.dwProcessId)
     msg.info(string.format("FFmpeg created suspended (PID: %d), injecting FontHelper...", pid))
 
-    -- Ensure daemon is running in background so RPC service is active
-    utils.subprocess_detached({ args = { daemon_path, "-no-monitor", "-no-tray" } })
-
     -- Perform injection
     local inject_args = {
         daemon_path,
