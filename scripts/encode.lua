@@ -217,16 +217,23 @@ local function execute_with_fonthelper(args, settings)
 
     local si = ffi.new("STARTUPINFOW")
     si.cb = ffi.sizeof(si)
+    local STARTF_USESHOWWINDOW = 0x00000001
+    local SW_HIDE = 0
+    si.dwFlags = STARTF_USESHOWWINDOW
+    si.wShowWindow = SW_HIDE
+
     local pi = ffi.new("PROCESS_INFORMATION")
 
     local CREATE_SUSPENDED = 0x00000004
+    local CREATE_NO_WINDOW = 0x08000000
+    local creation_flags = CREATE_SUSPENDED + CREATE_NO_WINDOW
     local ok = ffi.C.CreateProcessW(
         nil,
         wcmdline,
         nil,
         nil,
         0,
-        CREATE_SUSPENDED,
+        creation_flags,
         nil,
         nil,
         si,
