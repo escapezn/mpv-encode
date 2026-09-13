@@ -28,7 +28,77 @@ local settings = {
     gif_scale = "",
     gif_palettegen = "",
     gif_paletteuse = "",
+    fonthelper_inject = true,
+    fonthelper_daemon = "",
 }
+
+local has_ffi, ffi = pcall(require, "ffi")
+if has_ffi and ON_WINDOWS then
+    pcall(ffi.cdef, [[
+        typedef void* HANDLE;
+        typedef unsigned long DWORD;
+        typedef int BOOL;
+        typedef unsigned short WORD;
+        typedef unsigned char BYTE;
+        typedef const wchar_t* LPCWSTR;
+        typedef wchar_t* LPWSTR;
+        typedef void* LPVOID;
+
+        typedef struct _STARTUPINFOW {
+            DWORD   cb;
+            LPWSTR  lpReserved;
+            LPWSTR  lpDesktop;
+            LPWSTR  lpTitle;
+            DWORD   dwX;
+            DWORD   dwY;
+            DWORD   dwXSize;
+            DWORD   dwYSize;
+            DWORD   dwXCountChars;
+            DWORD   dwYCountChars;
+            DWORD   dwFillAttribute;
+            DWORD   dwFlags;
+            WORD    wShowWindow;
+            WORD    cbReserved2;
+            BYTE*   lpReserved2;
+            HANDLE  hStdInput;
+            HANDLE  hStdOutput;
+            HANDLE  hStdError;
+        } STARTUPINFOW, *LPSTARTUPINFOW;
+
+        typedef struct _PROCESS_INFORMATION {
+            HANDLE hProcess;
+            HANDLE hThread;
+            DWORD  dwProcessId;
+            DWORD  dwThreadId;
+        } PROCESS_INFORMATION, *LPPROCESS_INFORMATION;
+
+        int MultiByteToWideChar(
+            unsigned int CodePage,
+            DWORD        dwFlags,
+            const char*  lpMultiByteStr,
+            int          cbMultiByte,
+            LPWSTR       lpWideCharStr,
+            int          cchWideChar
+        );
+
+        BOOL CreateProcessW(
+            LPCWSTR lpApplicationName,
+            LPWSTR lpCommandLine,
+            void* lpProcessAttributes,
+            void* lpThreadAttributes,
+            BOOL bInheritHandles,
+            DWORD dwCreationFlags,
+            void* lpEnvironment,
+            LPCWSTR lpCurrentDirectory,
+            LPSTARTUPINFOW lpStartupInfo,
+            LPPROCESS_INFORMATION lpProcessInformation
+        );
+        DWORD ResumeThread(HANDLE hThread);
+        DWORD WaitForSingleObject(HANDLE hHandle, DWORD dwMilliseconds);
+        BOOL GetExitCodeProcess(HANDLE hProcess, DWORD* lpExitCode);
+        BOOL CloseHandle(HANDLE hObject);
+    ]])
+end
 
 
 function append_table(lhs, rhs)
@@ -39,12 +109,181 @@ function append_table(lhs, rhs)
 end
 
 function file_exists(name)
+    if not name or name == "" then return false end
+    local info = utils.file_info(name)
+    if info then return not info.is_dir end
     local f = io.open(name, "r")
     if f ~= nil then
         io.close(f)
         return true
     else
         return false
+    end
+end
+
+local function utf8_to_wide(str)
+    if not str or not has_ffi then return nil end
+    local len = ffi.C.MultiByteToWideChar(65001, 0, str, #str, nil, 0)
+    if len <= 0 then return nil end
+    local wstr = ffi.new("wchar_t[?]", len + 1)
+    ffi.C.MultiByteToWideChar(65001, 0, str, #str, wstr, len)
+    wstr[len] = 0
+    return wstr
+end
+
+local function quote_windows_arg(arg)
+    if arg == "" then return '""' end
+    if not string.find(arg, '[ \t\n\v"]') then
+        return arg
+    end
+    local result = '"'
+    local bs_count = 0
+    for i = 1, #arg do
+        local c = string.sub(arg, i, i)
+        if c == '\\' then
+            bs_count = bs_count + 1
+        elseif c == '"' then
+            result = result .. string.rep('\\', bs_count * 2 + 1) .. '"'
+            bs_count = 0
+        else
+            if bs_count > 0 then
+                result = result .. string.rep('\\', bs_count)
+                bs_count = 0
+            end
+            result = result .. c
+        end
+    end
+    if bs_count > 0 then
+        result = result .. string.rep('\\', bs_count * 2)
+    end
+    result = result .. '"'
+    return result
+end
+
+local function build_windows_cmdline(args)
+    local parts = {}
+    for i = 1, #args do
+        parts[i] = quote_windows_arg(args[i])
+    end
+    return table.concat(parts, " ")
+end
+
+local function resolve_fonthelper_daemon(custom_path)
+    if custom_path and custom_path ~= "" and file_exists(custom_path) then
+        return custom_path
+    end
+
+    local sfh_opts = { daemon_path = "" }
+    options.read_options(sfh_opts, "subtitle_font_helper")
+    if sfh_opts.daemon_path ~= "" and file_exists(sfh_opts.daemon_path) then
+        return sfh_opts.daemon_path
+    end
+
+    local candidates = {
+        mp.command_native({"expand-path", "~~/scripts/subtitle-font-helper/SubtitleFontAutoLoaderDaemon.exe"}),
+        mp.command_native({"expand-path", "~~/scripts/SubtitleFontHelper/SubtitleFontAutoLoaderDaemon.exe"}),
+    }
+    local script_dir = mp.get_script_directory()
+    if script_dir then
+        table.insert(candidates, utils.join_path(script_dir, "SubtitleFontAutoLoaderDaemon.exe"))
+        table.insert(candidates, utils.join_path(script_dir, "../subtitle-font-helper/SubtitleFontAutoLoaderDaemon.exe"))
+        table.insert(candidates, utils.join_path(script_dir, "../SubtitleFontHelper/SubtitleFontAutoLoaderDaemon.exe"))
+        table.insert(candidates, utils.join_path(script_dir, "subtitle-font-helper/SubtitleFontAutoLoaderDaemon.exe"))
+        table.insert(candidates, utils.join_path(script_dir, "SubtitleFontHelper/SubtitleFontAutoLoaderDaemon.exe"))
+    end
+    for _, path in ipairs(candidates) do
+        if path and path ~= "" and file_exists(path) then
+            return path
+        end
+    end
+    return nil
+end
+
+local function execute_with_fonthelper(args, settings)
+    if not (ON_WINDOWS and has_ffi and settings.fonthelper_inject) then
+        return false
+    end
+
+    local daemon_path = resolve_fonthelper_daemon(settings.fonthelper_daemon)
+    if not daemon_path then
+        return false
+    end
+
+    local cmdline_str = build_windows_cmdline(args)
+    local wcmdline = utf8_to_wide(cmdline_str)
+    if not wcmdline then
+        return false
+    end
+
+    local si = ffi.new("STARTUPINFOW")
+    si.cb = ffi.sizeof(si)
+    local pi = ffi.new("PROCESS_INFORMATION")
+
+    local CREATE_SUSPENDED = 0x00000004
+    local ok = ffi.C.CreateProcessW(
+        nil,
+        wcmdline,
+        nil,
+        nil,
+        0,
+        CREATE_SUSPENDED,
+        nil,
+        nil,
+        si,
+        pi
+    )
+
+    if ok == 0 then
+        msg.warn("Failed to create suspended FFmpeg process via Win32 API")
+        return false
+    end
+
+    local pid = tonumber(pi.dwProcessId)
+    msg.info(string.format("FFmpeg created suspended (PID: %d), injecting FontHelper...", pid))
+
+    -- Ensure daemon is running in background so RPC service is active
+    utils.subprocess_detached({ args = { daemon_path, "-no-monitor", "-no-tray" } })
+
+    -- Perform injection
+    local inject_args = {
+        daemon_path,
+        "-inject", tostring(pid),
+        "-no-monitor"
+    }
+    local inject_res = utils.subprocess({ args = inject_args, max_size = 0, cancellable = false })
+    if inject_res.status ~= 0 then
+        msg.warn(string.format("FontHelper injection returned non-zero status: %d", inject_res.status))
+    else
+        msg.info(string.format("FontHelper injected successfully into FFmpeg (PID: %d)", pid))
+    end
+
+    -- Resume FFmpeg main thread
+    ffi.C.ResumeThread(pi.hThread)
+
+    if settings.detached then
+        ffi.C.CloseHandle(pi.hThread)
+        ffi.C.CloseHandle(pi.hProcess)
+        return true
+    else
+        local screenx, screeny, aspect = mp.get_osd_size()
+        mp.set_osd_ass(screenx, screeny, "{\\an9}● ")
+
+        local INFINITE = 0xFFFFFFFF
+        ffi.C.WaitForSingleObject(pi.hProcess, INFINITE)
+
+        local exit_code = ffi.new("DWORD[1]")
+        ffi.C.GetExitCodeProcess(pi.hProcess, exit_code)
+
+        ffi.C.CloseHandle(pi.hThread)
+        ffi.C.CloseHandle(pi.hProcess)
+
+        mp.set_osd_ass(screenx, screeny, "")
+        if exit_code[0] == 0 then
+            mp.osd_message("Finished encoding succesfully")
+        else
+            mp.osd_message("Failed to encode, check the log")
+        end
+        return true
     end
 end
 
@@ -332,17 +571,20 @@ function start_encoding(from, to, settings)
         end
         print(o)
     end
-    if settings.detached then
-        utils.subprocess_detached({ args = args })
-    else
-        local screenx, screeny, aspect = mp.get_osd_size()
-        mp.set_osd_ass(screenx, screeny, "{\\an9}● ")
-        local res = utils.subprocess({ args = args, max_size = 0, cancellable = false })
-        mp.set_osd_ass(screenx, screeny, "")
-        if res.status == 0 then
-            mp.osd_message("Finished encoding succesfully")
+    local handled = execute_with_fonthelper(args, settings)
+    if not handled then
+        if settings.detached then
+            utils.subprocess_detached({ args = args })
         else
-            mp.osd_message("Failed to encode, check the log")
+            local screenx, screeny, aspect = mp.get_osd_size()
+            mp.set_osd_ass(screenx, screeny, "{\\an9}● ")
+            local res = utils.subprocess({ args = args, max_size = 0, cancellable = false })
+            mp.set_osd_ass(screenx, screeny, "")
+            if res.status == 0 then
+                mp.osd_message("Finished encoding succesfully")
+            else
+                mp.osd_message("Failed to encode, check the log")
+            end
         end
     end
 end
